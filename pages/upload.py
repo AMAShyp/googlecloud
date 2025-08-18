@@ -7,12 +7,12 @@ import streamlit as st
 from db_handler import DatabaseManager
 
 st.set_page_config(page_title="CSV → Table Upload", layout="wide")
-st.title("⬆️ Upload CSV Data to a Table")
+st.title("⬆️ CSV → Table Upload (with table-specific templates)")
 
 db = DatabaseManager()
 
 # ───────────────────────────────────────────────────────────────
-# Helpers: metadata
+# Helpers
 # ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=60)
 def list_tables():
@@ -33,16 +33,32 @@ def table_columns(schema: str, table: str) -> pd.DataFrame:
             c.column_name,
             c.data_type,
             c.is_nullable = 'YES' AS is_nullable,
-            c.column_default
+            c.column_default,
+            c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale
         FROM information_schema.columns c
         WHERE c.table_schema = %s AND c.table_name = %s
         ORDER BY c.ordinal_position
     """
     return db.fetch_data(q, (schema, table))
 
-# ───────────────────────────────────────────────────────────────
-# Helpers: CSV & mapping
-# ───────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=60)
+def table_primary_keys(schema: str, table: str) -> list[str]:
+    q = """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = %s
+          AND tc.table_name = %s
+        ORDER BY kcu.ordinal_position
+    """
+    df = db.fetch_data(q, (schema, table))
+    return df["column_name"].tolist()
+
 def normalize_name(s: str) -> str:
     s = (s or "").strip()
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
@@ -52,7 +68,8 @@ def automap(csv_cols, table_cols):
     norm_csv = {normalize_name(c): c for c in csv_cols}
     mapping = {}
     for tcol in table_cols:
-        mapping[tcol] = norm_csv.get(normalize_name(tcol))  # may be None
+        key = normalize_name(tcol)
+        mapping[tcol] = norm_csv.get(key)  # may be None
     return mapping
 
 def csv_to_df(uploaded_file, delimiter, encoding, has_header, quotechar):
@@ -84,117 +101,128 @@ def coerce_cell(val: str):
     return val
 
 # ───────────────────────────────────────────────────────────────
-# NEW: Sample CSV generation
+# CSV template generator (per data type)
 # ───────────────────────────────────────────────────────────────
-def example_value(pg_type: str, i: int) -> str:
-    """Return a simple example value string for a given Postgres data_type."""
-    t = (pg_type or "").lower()
-    # common scalar types
-    if t in ("integer", "int", "int4", "smallint", "int2", "bigint", "int8", "serial", "bigserial"):
-        return str(1000 + i)
-    if "numeric" in t or "decimal" in t or "double" in t or "real" in t or "float" in t:
-        return f"{i + 0.5}"
-    if t in ("boolean", "bool"):
-        return "true" if i % 2 == 0 else "false"
-    if "timestamp" in t:
-        return "2025-01-01 12:00:00"
-    if t == "date":
+def example_for_type(row) -> str:
+    dt = (row["data_type"] or "").lower()
+    # quick examples per type
+    if "int" in dt:
+        return "123"
+    if "numeric" in dt or "decimal" in dt:
+        return "9.99"
+    if "double" in dt or "real" in dt or "float" in dt:
+        return "3.14"
+    if "bool" in dt:
+        return "true"
+    if "date" == dt:
         return "2025-01-01"
-    if t == "time":
+    if "timestamp" in dt:
+        return "2025-01-01 12:34:56"
+    if "time" == dt:
         return "12:34:56"
-    if "uuid" in t:
-        # looks like uuid but string okay; DB or app can cast
-        return f"00000000-0000-0000-0000-0000000000{i%10}"
-    if "json" in t:
+    if "uuid" in dt:
+        return "00000000-0000-0000-0000-000000000000"
+    if "json" in dt:
         return '{"key":"value"}'
-    if "char" in t or "text" in t or "name" in t:
-        return f"sample_{i}"
-    if "bytea" in t:
-        return "\\x"  # empty bytea
-    # fallback
-    return f"sample_{i}"
+    if "char" in dt or "text" in dt:
+        return "example"
+    return "value"
 
-def build_sample_dataframe(cols_df: pd.DataFrame, required_only: bool, sample_rows: int = 5) -> pd.DataFrame:
-    """
-    Create a sample DataFrame with headers matching the table columns.
-    If required_only=True, include only columns that are NOT NULL and have NO default.
-    """
-    df = cols_df.copy()
-    if required_only:
-        # required if NOT nullable AND has no default
-        req_mask = (~df["is_nullable"]) & (df["column_default"].isna() | (df["column_default"] == ""))
-        df = df[req_mask]
+def build_csv_template(cols_df: pd.DataFrame, pks: list[str]) -> pd.DataFrame:
+    # Column order = table order; include all columns.
+    # Example row = one best-effort example based on data type.
+    example = {}
+    for _, r in cols_df.iterrows():
+        c = r["column_name"]
+        example[c] = example_for_type(r)
+    # two rows for illustration
+    df = pd.DataFrame([example, example])
+    return df
 
-    headers = df["column_name"].tolist()
-    types = df["data_type"].tolist()
-
-    rows = []
-    for i in range(sample_rows):
-        rows.append([example_value(types[j], i) for j in range(len(headers))])
-
-    return pd.DataFrame(rows, columns=headers)
+def required_columns(cols_df: pd.DataFrame, pks: list[str]) -> list[str]:
+    req = []
+    for _, r in cols_df.iterrows():
+        c = r["column_name"]
+        not_null = not bool(r["is_nullable"])
+        has_default = r["column_default"] not in (None, "")
+        # PKs are effectively required unless default (e.g. serial)
+        if c in pks and not has_default:
+            req.append(c)
+        elif not_null and not has_default:
+            req.append(c)
+    return req
 
 # ───────────────────────────────────────────────────────────────
-# UI — pick target table + CSV settings
+# UI — target table selection + template
 # ───────────────────────────────────────────────────────────────
-optA, optB, optC, optD = st.columns([1, 1, 1, 1])
-with optA:
+left, right = st.columns([1, 1])
+with left:
     delim = st.text_input("Delimiter", value=",", help="e.g. , ; | \\t")
-with optB:
     enc = st.text_input("Encoding", value="utf-8")
-with optC:
+with right:
     quotechar = st.text_input("Quote char", value='"')
-with optD:
-    has_header = st.checkbox("CSV has header", value=True)
+    has_header = st.checkbox("CSV has header row", value=True)
 
 tables = list_tables()
 schemas = sorted(tables["table_schema"].unique().tolist())
-schema = st.selectbox("Schema", options=schemas, index=schemas.index("public") if "public" in schemas else 0)
+schema = st.selectbox(
+    "Schema",
+    options=schemas,
+    index=0 if "public" not in schemas else schemas.index("public"),
+)
 subset = tables[tables["table_schema"] == schema]
 table = st.selectbox("Table", options=subset["table_name"].tolist() or ["— none —"])
 
-cols_df = pd.DataFrame()
-if table and table != "— none —":
-    cols_df = table_columns(schema, table)
-    with st.expander("Table columns (from information_schema)"):
-        st.dataframe(cols_df, use_container_width=True, hide_index=True)
+if not table or table == "— none —":
+    st.info("Pick a schema and table to continue.")
+    st.stop()
 
-# ───────────────────────────────────────────────────────────────
-# NEW: Sample CSV generator (downloadable)
-# ───────────────────────────────────────────────────────────────
-st.subheader("📄 Sample CSV for this table")
-if cols_df.empty:
-    st.info("Pick a table to generate a sample CSV.")
-else:
-    sleft, sright = st.columns([1, 3])
-    with sleft:
-        required_only = st.checkbox("Only required columns", value=True,
-                                    help="Include non-nullable columns without default.")
-        sample_rows = st.number_input("Sample rows", 1, 100, 5, 1)
-    sample_df = build_sample_dataframe(cols_df, required_only=required_only, sample_rows=int(sample_rows))
-    st.dataframe(sample_df, use_container_width=True)
+cols_df = table_columns(schema, table)
+pks = table_primary_keys(schema, table)
+req_cols = required_columns(cols_df, pks)
+template_df = build_csv_template(cols_df, pks)
+
+st.subheader("📘 Data dictionary")
+dd = cols_df.copy()
+dd.insert(1, "is_primary_key", dd["column_name"].isin(pks))
+st.dataframe(dd, use_container_width=True, hide_index=True)
+
+with st.expander("📄 CSV Template & Examples", expanded=True):
+    st.markdown(
+        f"""
+**How to prepare your CSV for `{schema}.{table}`**
+
+- Columns may be in **any order** — you will map them before upload.
+- **Required columns** (no default & NOT NULL or part of PK): `{', '.join(req_cols) if req_cols else '— none —'}`.
+- **Optional columns** can be left out or blank (they’ll be inserted as NULL).
+- Suggested formats:
+  - **DATE**: `YYYY-MM-DD` (e.g., `2025-01-01`)
+  - **TIMESTAMP**: `YYYY-MM-DD HH:MM:SS` (e.g., `2025-01-01 12:34:56`)
+  - **BOOLEAN**: `true` / `false`
+  - **NUMERIC**: plain digits like `9.99`
+- If your file has no header row, uncheck “CSV has header row” and we’ll generate generic names.
+        """
+    )
+    st.write("**Template preview (example values):**")
+    st.dataframe(template_df, use_container_width=True)
     st.download_button(
-        "⬇️ Download sample CSV",
-        data=sample_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{schema}.{table}.sample.csv",
+        "⬇️ Download CSV template",
+        data=template_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{schema}.{table}.template.csv",
         mime="text/csv",
     )
-    st.caption("Tip: start from this CSV, then add/remove columns/rows as needed.")
 
-st.divider()
-st.subheader("📥 Upload your CSV")
-
-uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+# ───────────────────────────────────────────────────────────────
+# Upload the CSV
+# ───────────────────────────────────────────────────────────────
+uploaded = st.file_uploader("Choose a CSV file to upload into this table", type=["csv"])
 if not uploaded:
     st.info("Pick a CSV to continue.")
     st.stop()
 
-# ───────────────────────────────────────────────────────────────
 # Read CSV + show preview
-# ───────────────────────────────────────────────────────────────
 try:
-    df_csv = csv_to_df(uploaded, delimiter=delim.replace("\\t", "\t"), encoding=enc,
-                       has_header=has_header, quotechar=quotechar)
+    df_csv = csv_to_df(uploaded, delimiter=delim.replace("\\t", "\t"), encoding=enc, has_header=has_header, quotechar=quotechar)
 except Exception as e:
     st.error(f"Failed to read CSV: {e}")
     st.stop()
@@ -202,14 +230,10 @@ except Exception as e:
 st.write("**CSV Preview**")
 st.dataframe(df_csv.head(50), use_container_width=True)
 
-if cols_df.empty:
-    st.warning("No columns found for the selected table.")
-    st.stop()
-
 # ───────────────────────────────────────────────────────────────
-# Column mapping (auto + override)
+# Column mapping
 # ───────────────────────────────────────────────────────────────
-st.subheader("Map CSV columns to table columns")
+st.subheader("Map CSV columns → table columns")
 table_cols = cols_df["column_name"].tolist()
 csv_cols = df_csv.columns.tolist()
 default_map = automap(csv_cols, table_cols)
@@ -217,31 +241,37 @@ default_map = automap(csv_cols, table_cols)
 mapping = {}
 map_cols = st.container()
 with map_cols:
-    m1, m2 = st.columns([2.5, 1.5])
+    m1, m2 = st.columns([2, 2])
     with m1:
         st.caption("Table column → CSV column")
         for tcol in table_cols:
             default_choice = default_map.get(tcol)
-            options = ["— skip —"] + csv_cols
             mapping[tcol] = st.selectbox(
                 f'↪ {tcol}',
-                options=options,
-                index=(options.index(default_choice) if default_choice in csv_cols else 0),
+                options=["— skip —"] + csv_cols,
+                index=(["— skip —"] + csv_cols).index(default_choice) if default_choice in csv_cols else 0,
                 key=f"map_{tcol}",
             )
     with m2:
-        st.caption("Load options")
+        st.caption("Options")
         truncate = st.checkbox("TRUNCATE table before load (danger!)", value=False)
         on_conflict = st.checkbox("ON CONFLICT DO NOTHING (skip duplicates)", value=True)
-        chunk_size = st.number_input("Insert chunk size", min_value=100, max_value=20000, value=1000, step=100)
+        chunk_size = st.number_input("Insert chunk size", min_value=100, max_value=10000, value=1000, step=100)
 
 # Effective columns to load
 target_cols = [c for c in table_cols if mapping.get(c) and mapping[c] != "— skip —"]
+
+# Validate required columns mapped
+missing_required = [c for c in req_cols if c not in target_cols]
+if missing_required:
+    st.error(f"These required columns are not mapped: {', '.join(missing_required)}")
+    st.stop()
+
 if not target_cols:
     st.warning("No columns mapped. Map at least one table column to a CSV column.")
     st.stop()
 
-# Build mapped frame
+# Build a preview of the mapped frame
 mapped = pd.DataFrame()
 try:
     for tcol in target_cols:
@@ -252,45 +282,44 @@ except KeyError as e:
 
 st.write("**Mapped Preview**")
 st.dataframe(mapped.head(50), use_container_width=True)
-st.caption(f"{len(mapped):,} rows will be attempted to insert into {schema}.{table} with columns {target_cols}.")
+st.caption(f"{len(mapped):,} rows will be inserted into {schema}.{table} with columns {target_cols}.")
 
 # ───────────────────────────────────────────────────────────────
-# Upload action (chunked executemany + per-chunk transaction)
+# Upload action (chunked insert)
 # ───────────────────────────────────────────────────────────────
 do_upload = st.button("🚀 Start upload")
 if not do_upload:
     st.stop()
 
+# Confirm destructive option
 if truncate:
     st.error("You chose to TRUNCATE the table before load. This will DELETE all existing rows.")
     if not st.checkbox("I understand, proceed with TRUNCATE"):
         st.stop()
 
 try:
+    # Optional truncate first
     if truncate:
         db.execute_command(f'TRUNCATE TABLE "{schema}"."{table}" RESTART IDENTITY CASCADE;')
 
     insert_sql = build_insert_sql(schema, table, target_cols, on_conflict_do_nothing=on_conflict)
-    total_rows = len(mapped)
-    chunks = int(math.ceil(total_rows / chunk_size)) if total_rows else 0
 
+    total_rows = len(mapped)
+    chunks = int(math.ceil(total_rows / chunk_size))
     prog = st.progress(0.0)
     status = st.empty()
-    inserted_total = 0
 
+    inserted_total = 0
     for i in range(chunks):
         start = i * chunk_size
         end = min((i + 1) * chunk_size, total_rows)
         batch = mapped.iloc[start:end]
-
-        # Prepare params for executemany
-        vals = batch.apply(lambda r: tuple(r[c] for c in target_cols), axis=1).tolist()
+        params = [tuple(batch[c].tolist()[j] for c in target_cols) for j in range(len(batch))]
 
         cur = db.conn.cursor()
         try:
-            # generous per-chunk timeout (120s)
-            cur.execute("SET LOCAL statement_timeout = 120000;")
-            cur.executemany(insert_sql, vals)
+            cur.execute("SET LOCAL statement_timeout = 120000;")  # 120s per chunk
+            cur.executemany(insert_sql, params)
         except Exception as e:
             db.conn.rollback()
             cur.close()
@@ -301,7 +330,7 @@ try:
             cur.close()
             inserted_total += len(batch)
 
-        prog.progress((i + 1) / chunks if chunks else 1.0)
+        prog.progress((i + 1) / chunks)
         status.info(f"Inserted {inserted_total:,}/{total_rows:,} rows...")
 
     prog.progress(1.0)
