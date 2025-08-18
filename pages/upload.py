@@ -8,13 +8,13 @@ import pandas as pd
 import streamlit as st
 from db_handler import DatabaseManager
 
-st.set_page_config(page_title="CSV → Table Upload (Multi-row INSERT)", layout="wide")
-st.title("⬆️ CSV → Table Upload (Multi-row INSERT, Upsert, Debug)")
+st.set_page_config(page_title="CSV → Table Upload (NULL fix + Multi-row INSERT)", layout="wide")
+st.title("⬆️ CSV → Table Upload (NULL token normalization + Upsert + Debug)")
 
 db = DatabaseManager()
 
 # ───────────────────────────────────────────────────────────────
-# Debug log (session-scoped)
+# Debug log (session)
 # ───────────────────────────────────────────────────────────────
 if "upload_logs" not in st.session_state:
     st.session_state.upload_logs = []
@@ -80,8 +80,8 @@ def primary_keys(schema: str, table: str) -> list[str]:
       SELECT kcu.column_name
       FROM information_schema.table_constraints tc
       JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name=kcu.constraint_name
-       AND tc.table_schema=kcu.table_schema
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema   = kcu.table_schema
       WHERE tc.constraint_type='PRIMARY KEY'
         AND tc.table_schema=%s AND tc.table_name=%s
       ORDER BY kcu.ordinal_position
@@ -133,13 +133,6 @@ def read_csv(uploaded, delimiter, encoding, has_header, quotechar):
     df.columns = [f"column_{i+1}" for i in range(df.shape[1])]
     return df
 
-def coerce_cell(v):
-    if v is None: return None
-    if isinstance(v, str):
-        v = v.strip()
-        return None if v=="" else v
-    return v
-
 def example_for_type(dt: str) -> str:
     dt = (dt or "").lower()
     if "int" in dt: return "123"
@@ -174,7 +167,7 @@ def required_columns(cols_df: pd.DataFrame, pks: list[str]) -> list[str]:
     return req
 
 # ───────────────────────────────────────────────────────────────
-# SQL builder (multi-row VALUES, no executemany)
+# SQL builder (multi-row VALUES)
 # ───────────────────────────────────────────────────────────────
 def build_multirow_insert_sql(schema: str,
                               table: str,
@@ -182,9 +175,6 @@ def build_multirow_insert_sql(schema: str,
                               n_rows: int,
                               mode: str,
                               conflict_target: tuple[str, ...] | None) -> str:
-    """
-    Build: INSERT INTO ... (cols) VALUES (...), (...), ... [ON CONFLICT ...]
-    """
     cols_quoted = ", ".join([f'"{c}"' for c in cols])
     row_ph = "(" + ", ".join(["%s"] * len(cols)) + ")"
     values_clause = ", ".join([row_ph] * n_rows)
@@ -193,7 +183,6 @@ def build_multirow_insert_sql(schema: str,
         sql += " ON CONFLICT DO NOTHING"
     elif mode == "upsert" and conflict_target:
         conflict_cols = ", ".join([f'"{c}"' for c in conflict_target])
-        # Update all mapped columns except the conflict columns
         update_cols = [c for c in cols if c not in conflict_target]
         if update_cols:
             set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
@@ -203,28 +192,31 @@ def build_multirow_insert_sql(schema: str,
     return sql
 
 def flatten_params(rows: list[tuple]) -> list:
-    flat = []
-    for row in rows:
-        flat.extend(row)
+    flat=[]
+    for r in rows: flat.extend(r)
     return flat
 
 # ───────────────────────────────────────────────────────────────
 # UI controls
 # ───────────────────────────────────────────────────────────────
-cA, cB, cC = st.columns([1.5, 1, 1])
+cA, cB, cC = st.columns([1.6, 1.2, 1])
 with cA:
     delim = st.text_input("Delimiter", value=",", help="e.g. , ; | \\t").replace("\\t","\t")
     enc = st.text_input("Encoding", value="utf-8")
 with cB:
     quotechar = st.text_input("Quote char", value='"')
     has_header = st.checkbox("CSV has header row", value=True)
+    # NULL token normalization settings
+    st.markdown("**NULL token normalization**")
+    null_tokens_text = st.text_input(
+        "Treat these tokens as NULL (case-insensitive, comma-separated)",
+        value="None,null,nan,na,n/a",
+        help="These string values will be converted to SQL NULL."
+    )
+    NULL_TOKENS = {t.strip().lower() for t in null_tokens_text.split(",") if t.strip() != ""}
 with cC:
-    # For ~25k rows: 1,000 values per statement keeps params well under 65,535 even for wide tables.
-    rows_per_stmt = st.number_input("Rows per INSERT statement", min_value=200, max_value=5000, value=1000, step=100,
-                                    help="Number of rows combined into a single multi-row INSERT.")
-    # High-level progress chunk (how often UI updates; independent from rows_per_stmt)
-    progress_chunk = st.number_input("Progress update step", min_value=rows_per_stmt, max_value=50000, value=2000, step=rows_per_stmt,
-                                     help="UI progress updates after this many rows.")
+    rows_per_stmt = st.number_input("Rows per INSERT statement", min_value=200, max_value=5000, value=1000, step=100)
+    progress_chunk = st.number_input("Progress update step", min_value=rows_per_stmt, max_value=50000, value=2000, step=rows_per_stmt)
 
 tables = list_tables()
 schemas = sorted(tables["table_schema"].unique().tolist())
@@ -249,7 +241,7 @@ tmpl    = csv_template(cols_df)
 st.subheader("📘 Data dictionary")
 dd = cols_df.copy()
 if not dd.empty:
-    dd.insert(1, "is_primary_key", dd["column_name"].isin(pks))
+    dd.insert(1,"is_primary_key", dd["column_name"].isin(pks))
 st.dataframe(dd if not dd.empty else pd.DataFrame([{"info":"No columns found."}]),
              use_container_width=True, hide_index=True)
 
@@ -267,6 +259,7 @@ if not uploaded:
     st.info("Upload a CSV to continue.")
     st.stop()
 
+# Read CSV
 try:
     df_csv = read_csv(uploaded, delim, enc, has_header, quotechar)
 except Exception as e:
@@ -281,11 +274,10 @@ st.dataframe(df_csv.head(50), use_container_width=True)
 st.subheader("Map CSV columns → table columns")
 table_cols = cols_df["column_name"].tolist() if "column_name" in cols_df.columns else []
 if not table_cols:
-    st.error("No table columns available; can't proceed.")
+    st.error("No table columns; cannot continue.")
     st.stop()
 
 default_map = automap(df_csv.columns.tolist(), table_cols)
-
 mapping = {}
 m1, m2 = st.columns([2, 2])
 with m1:
@@ -303,7 +295,7 @@ with m2:
     mode_opt = st.radio("On conflict", ["Skip (DO NOTHING)", "Upsert (DO UPDATE)"], index=0)
     mode = "skip" if mode_opt.startswith("Skip") else "upsert"
 
-    # conflict target choices
+    # Conflict targets from PK + unique constraints
     conflict_options = []
     if pks: conflict_options.append(tuple(pks))
     for combo in uniqs:
@@ -317,8 +309,19 @@ with m2:
     )
 
 # Determine target columns and required validation
+def required_columns_local(cols_df: pd.DataFrame, pks: list[str]) -> list[str]:
+    req=[]
+    if cols_df.empty: return req
+    for _,r in cols_df.iterrows():
+        c=r["column_name"]
+        not_null = not bool(r.get("is_nullable", False))
+        has_def  = str(r.get("column_default","") or "")!=""
+        if c in pks and not has_def: req.append(c)
+        elif not_null and not has_def: req.append(c)
+    return req
+
 target_cols = [c for c in table_cols if mapping.get(c) and mapping[c] != "— skip —"]
-req_cols = required_columns(cols_df, pks)
+req_cols = required_columns_local(cols_df, pks)
 missing_req = [c for c in req_cols if c not in target_cols]
 if missing_req:
     st.error(f"Required columns not mapped: {', '.join(missing_req)}")
@@ -327,31 +330,66 @@ if not target_cols:
     st.warning("Map at least one column.")
     st.stop()
 
-# Build mapped DataFrame (target order)
+# Build mapped DataFrame (apply NULL token normalization)
+def to_null_if_token(val: str):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        v = val.strip()
+        # empty string -> NULL
+        if v == "":
+            return None
+        # token set (case-insensitive)
+        if v.lower() in NULL_TOKENS:
+            return None
+        return v
+    return val
+
 mapped = pd.DataFrame()
 for tcol in target_cols:
-    mapped[tcol] = df_csv[mapping[tcol]].map(coerce_cell)
+    mapped[tcol] = df_csv[mapping[tcol]].map(to_null_if_token)
 
-st.write("**Mapped Preview**")
+# Preflight: show how many NULLs created per column; warn for unique cols
+st.subheader("Preflight checks")
+null_counts = mapped.isna().sum()
+st.write("**Null counts after token normalization:**")
+st.dataframe(null_counts.to_frame("null_count"), use_container_width=True)
+
+# If a unique/PK column will be mostly NULL → warn (but Postgres allows multiple NULLs)
+unique_cols = set()
+for combo in ([tuple(pks)] if pks else []):
+    unique_cols.update(combo)
+for combo in unique_constraints(schema, table):
+    unique_cols.update(combo)
+uc_warn = {c: int(null_counts.get(c, 0)) for c in unique_cols if c in null_counts and null_counts[c] > 0}
+if uc_warn:
+    st.info(f"Note: Unique columns with NULLs (allowed in Postgres): {uc_warn}")
+
+st.write("**Mapped Preview (post-normalization):**")
 st.dataframe(mapped.head(50), use_container_width=True)
 st.caption(f"{len(mapped):,} rows → {schema}.{table} columns {target_cols}")
 
 # Optional row-by-row debug (first N)
 row_debug = st.checkbox("Row-by-row debug (first N)", value=False,
-                        help="Runs single-row INSERT for the first N rows. Slower, but great to diagnose conflicts/format issues.")
+                        help="Runs single-row INSERT for the first N rows to diagnose exact errors.")
 row_debug_n = st.number_input("N", min_value=1, max_value=200, value=25, step=1, disabled=not row_debug)
 
+def build_sql_for_n(n_rows: int) -> str:
+    return build_multirow_insert_sql(
+        schema, table, target_cols, n_rows,
+        mode, (conflict_target if mode=="upsert" else None)
+    )
+
 if row_debug:
-    st.info("Debugging first N rows individually...")
+    st.info("Debugging first N rows individually…")
+    sql_one = build_sql_for_n(1)
     results = []
-    sql_one = build_multirow_insert_sql(schema, table, target_cols, 1, mode,
-                                        conflict_target if mode=="upsert" else None)
     for idx, row in mapped.head(int(row_debug_n)).iterrows():
         params = tuple(row[c] for c in target_cols)
         cur = db.conn.cursor()
         try:
             cur.execute("SET LOCAL statement_timeout = 15000;")
-            cur.execute(sql_one, params)  # 1 row
+            cur.execute(sql_one, params)
             db.conn.commit()
             results.append({"row": int(idx + 1), "status": "ok"})
         except Exception as e:
@@ -362,7 +400,9 @@ if row_debug:
     st.dataframe(pd.DataFrame(results), use_container_width=True)
     log("row_debug", {"results": results})
 
-# Execute upload
+# ───────────────────────────────────────────────────────────────
+# Execute upload (multi-row INSERT, no executemany)
+# ───────────────────────────────────────────────────────────────
 go = st.button("🚀 Start upload")
 if not go:
     st.stop()
@@ -403,18 +443,14 @@ try:
         end_idx   = min((i + 1) * rows_per_stmt, total_rows)
         batch = mapped.iloc[start_idx:end_idx]
 
-        # Build rows as tuples and flatten params
         rows_tuples = list(batch[target_cols].itertuples(index=False, name=None))
-        sql_stmt = build_multirow_insert_sql(
-            schema, table, target_cols, len(rows_tuples),
-            mode, (conflict_target if mode=="upsert" else None)
-        )
+        sql_stmt = build_sql_for_n(len(rows_tuples))
         params = flatten_params(rows_tuples)
 
         cur = db.conn.cursor()
         t0 = time.time()
         try:
-            cur.execute("SET LOCAL statement_timeout = 180000;")  # 180s per statement
+            cur.execute("SET LOCAL statement_timeout = 180000;")
             cur.execute(sql_stmt, params)
         except Exception as e:
             db.conn.rollback()
@@ -441,10 +477,10 @@ try:
                 "rows_per_sec": round(rps, 1) if rps else None
             })
 
-        # Progress
+        # progress UI
         if (attempted_total % int(progress_chunk) == 0) or (i == num_stmts - 1):
             prog.progress(attempted_total / max(total_rows, 1))
-            status.info(f"Inserted/attempted {attempted_total:,}/{total_rows:,} rows "
+            status.info(f"Attempted {attempted_total:,}/{total_rows:,} rows "
                         f"(statement {i+1}/{num_stmts}).")
 
     total_elapsed = time.time() - t_all
