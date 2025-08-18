@@ -4,15 +4,14 @@ from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
-
 from db_handler import DatabaseManager
 
 st.set_page_config(page_title="Edit / Inspect Database", layout="wide")
 st.title("Edit / Inspect Database")
 
-db = DatabaseManager()  # single configured DB (Cloud SQL via pg8000)
+db = DatabaseManager()  # Cloud SQL via pg8000
 
-# ───────────────────────────── Schema overview ─────────────────────────────
+# ───────── Schema overview ─────────
 st.subheader("Schema overview")
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -38,8 +37,9 @@ def get_schema_columns(schema: str) -> pd.DataFrame:
 
 schemas = get_available_schemas()
 schema = st.selectbox(
-    "Schema", schemas or ["public"],
-    index=(schemas or ["public"]).index("public") if "public" in (schemas or []) else 0
+    "Schema",
+    schemas or ["public"],
+    index=(schemas or ["public"]).index("public") if "public" in (schemas or []) else 0,
 )
 
 schema_rows = get_schema_columns(schema)
@@ -59,13 +59,9 @@ st.caption(
     "or autocommit to run each statement independently."
 )
 
-# ───────────────────────────── Helpers ─────────────────────────────
+# ───────── Helpers ─────────
 def split_sql_statements(sql_text: str) -> List[str]:
-    """
-    Split SQL into individual statements.
-    Uses sqlparse if available; otherwise a safe-ish fallback that
-    splits on semicolons not inside single/double quotes or dollar-quoted blocks.
-    """
+    """Split SQL into statements (uses sqlparse if available; fallback otherwise)."""
     try:
         import sqlparse  # type: ignore
         stmts = [
@@ -75,31 +71,25 @@ def split_sql_statements(sql_text: str) -> List[str]:
         ]
         return [s.rstrip(";").strip() for s in stmts if s.rstrip(";").strip()]
     except Exception:
-        # Fallback: simple state machine
         s = sql_text or ""
         out, buf = [], []
-        in_single = False
-        in_double = False
-        in_dollar = False
+        in_single = in_double = in_dollar = False
         dollar_tag = ""
         i = 0
         while i < len(s):
             ch = s[i]
             buf.append(ch)
 
-            # detect dollar-quote start/end: $tag$
             if not in_single and not in_double:
                 if not in_dollar and ch == "$":
-                    # gather tag
                     j = i + 1
-                    while j < len(s) and s[j].isalnum() or (j < len(s) and s[j] == "_"):
+                    while j < len(s) and (s[j].isalnum() or s[j] == "_"):
                         j += 1
                     if j < len(s) and s[j] == "$":
                         in_dollar = True
-                        dollar_tag = s[i : j + 1]  # e.g. $func$
-                        i = j  # position at closing $
+                        dollar_tag = s[i : j + 1]  # like $tag$
+                        i = j
                 elif in_dollar and ch == "$":
-                    # possible end
                     tag_len = len(dollar_tag)
                     if i - tag_len + 1 >= 0 and s[i - tag_len + 1 : i + 1] == dollar_tag:
                         in_dollar = False
@@ -111,13 +101,10 @@ def split_sql_statements(sql_text: str) -> List[str]:
                 elif ch == '"' and not in_single and (i == 0 or s[i - 1] != "\\"):
                     in_double = not in_double
                 elif ch == ";" and not in_single and not in_double:
-                    # end of statement
-                    stmt = "".join(buf).strip()
-                    stmt = stmt[:-1].strip()  # remove trailing ';'
+                    stmt = "".join(buf).strip()[:-1].strip()
                     if stmt:
                         out.append(stmt)
                     buf = []
-
             i += 1
 
         tail = "".join(buf).strip()
@@ -126,14 +113,9 @@ def split_sql_statements(sql_text: str) -> List[str]:
         return [x for x in out if x]
 
 def _set_timeouts(cur, lock_timeout_ms: int, statement_timeout_ms: int, in_txn: bool):
-    """
-    Apply timeouts. Use SET LOCAL inside a transaction, otherwise SET/RESET.
-    Returns a boolean indicating whether RESET is required on exit.
-    """
     if in_txn:
         cur.execute(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms';")
         cur.execute(f"SET LOCAL statement_timeout = '{int(statement_timeout_ms)}ms';")
-        # Guard long-running idle in txn
         cur.execute("SET LOCAL idle_in_transaction_session_timeout = '15000ms';")
         return False
     else:
@@ -146,11 +128,6 @@ def _reset_timeouts(cur):
     cur.execute("RESET statement_timeout;")
 
 def _pg8000_err_to_text(e: Exception) -> str:
-    """
-    Turn pg8000 / Postgres error into a readable line.
-    pg8000 often puts a dict as e.args[0] with keys like 'C','M','D','n', etc.
-    """
-    msg = repr(e)
     try:
         first = e.args[0]
         if isinstance(first, dict):
@@ -162,7 +139,7 @@ def _pg8000_err_to_text(e: Exception) -> str:
             return f"[{code}] {msgtxt}" + (f" • {detail}" if detail else "") + (f" • table={rel}" if rel else "") + (f" • constraint={name}" if name else "")
     except Exception:
         pass
-    return msg
+    return str(e)
 
 def run_one_statement(
     sql: str,
@@ -173,18 +150,20 @@ def run_one_statement(
     in_txn: bool,
 ) -> Tuple[str, object, float]:
     """
-    Execute one statement using db.conn and return (kind, payload, elapsed_sec).
-    kind: "result" -> payload is DataFrame; "ok" -> payload is status string.
+    Returns: (kind, payload, elapsed_sec)
+      kind="result" -> payload is DataFrame
+      kind="ok"     -> payload is status string (built from rowcount)
     """
     to_exec = sql if not explain else f"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) {sql}"
 
     start = time.perf_counter()
     cur = db.conn.cursor()
+    needs_reset = False
     try:
         needs_reset = _set_timeouts(cur, lock_timeout_ms, statement_timeout_ms, in_txn)
         cur.execute(to_exec)
 
-        if cur.description:  # rows returned
+        if cur.description:  # query returned rows
             rows = cur.fetchall()
             cols = [c[0] for c in cur.description]
             if max_rows is not None and max_rows > 0 and len(rows) > max_rows:
@@ -193,12 +172,15 @@ def run_one_statement(
             kind = "result"
         else:
             rc = cur.rowcount
-            msg = cur.statusmessage or "Command executed."
-            payload = f"{msg}" + ("" if rc in (-1, None) else f" • rowcount={rc}")
+            # pg8000 cursor has no statusmessage; craft a friendly message
+            if rc in (-1, None):
+                payload = "Command executed."
+            else:
+                payload = f"Command executed • rowcount={rc}"
             kind = "ok"
 
-        # no commit here; caller decides (txn vs autocommit)
-        return kind, payload, time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        return (kind, payload, elapsed)
     finally:
         try:
             if needs_reset:
@@ -207,7 +189,7 @@ def run_one_statement(
             pass
         cur.close()
 
-# ───────────────────────────── SQL Runner UI ─────────────────────────────
+# ───────── SQL Runner UI ─────────
 st.subheader("Run arbitrary SQL")
 
 with st.expander("Execution settings", expanded=True):
@@ -244,7 +226,21 @@ with st.expander("Execution settings", expanded=True):
 sql_txt = st.text_area(
     "SQL to execute inside this DB (multiple statements supported)",
     height=220,
-    placeholder="Paste one or more SQL statements separated by semicolons…\n\nExample:\nCREATE TABLE public.demo(id bigserial primary key, name text not null);\nINSERT INTO public.demo(name) VALUES ('hello'),('world');\nSELECT * FROM public.demo;",
+    placeholder=(
+        "Paste one or more SQL statements separated by semicolons…\n\n"
+        "Example:\n"
+        "CREATE TABLE public.shelf_map_locations (\n"
+        "  locid varchar NOT NULL,\n"
+        "  label varchar,\n"
+        "  x_pct numeric,\n"
+        "  y_pct numeric,\n"
+        "  w_pct numeric,\n"
+        "  h_pct numeric,\n"
+        "  rotation_deg real,\n"
+        "  PRIMARY KEY (locid)\n"
+        ");\n"
+        "SELECT * FROM information_schema.tables WHERE table_schema='public';"
+    ),
 )
 
 if st.button("Run SQL"):
@@ -255,7 +251,7 @@ if st.button("Run SQL"):
 
     with st.spinner(f"Executing {len(stmts)} statement(s)…"):
         if single_txn:
-            # One transaction for ALL statements. Roll back and stop on first error.
+            # Run all in one transaction
             cur = db.conn.cursor()
             try:
                 cur.execute("BEGIN;")
@@ -285,19 +281,16 @@ if st.button("Run SQL"):
                             st.caption(f"Returned {len(payload)} row(s) • {elapsed*1000:.0f} ms")
                         else:
                             st.success(f"{payload} • {elapsed*1000:.0f} ms")
-
-                # all ok
                 db.conn.commit()
             finally:
                 try:
                     cur = db.conn.cursor()
-                    cur.execute("END;")  # ensure txn closed if still open
+                    cur.execute("END;")
                     cur.close()
                 except Exception:
                     pass
-
         else:
-            # Autocommit per statement; continue on errors
+            # Autocommit per statement
             for idx, stmt in enumerate(stmts, start=1):
                 pretty = f"Statement {idx}"
                 with st.container(border=True):
@@ -312,7 +305,7 @@ if st.button("Run SQL"):
                             explain,
                             in_txn=False,
                         )
-                        db.conn.commit()  # commit this statement
+                        db.conn.commit()
                     except Exception as e:
                         db.conn.rollback()
                         st.error(_pg8000_err_to_text(e))
