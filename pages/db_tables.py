@@ -144,7 +144,7 @@ with left:
     if st.button("🔄 Refresh", use_container_width=True):
         load_objects.clear(); get_columns.clear()
         get_row_count.clear(); preview_table.clear()
-        st.experimental_rerun()
+        st.rerun()
 
     show_cols = st.checkbox("Show columns", True)
     do_preview = st.checkbox("Preview data", True)
