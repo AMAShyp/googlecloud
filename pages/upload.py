@@ -1,154 +1,136 @@
 # pages/upload.py
 import io
+import math
 import time
 import json
-import math
-import uuid
 import unicodedata
 import pandas as pd
 import streamlit as st
-
-# Your connector-based db manager (for catalog queries)
 from db_handler import DatabaseManager
 
-# For COPY we use psycopg2 through the Cloud SQL Connector (separate path)
-from google.cloud.sql.connector import Connector
-from google.oauth2 import service_account
-import psycopg2
+st.set_page_config(page_title="CSV → Table Upload (Upsert, Chunks, Debug)", layout="wide")
+st.title("⬆️ CSV → Table Upload (Upsert, Chunks, Debug)")
 
-st.set_page_config(page_title="CSV → Table Upload (COPY)", layout="wide")
-st.title("⬆️ CSV → Table Upload (staging + COPY)")
+db = DatabaseManager()
 
-###############################################################################
-# 0) Build a psycopg2 connection via Cloud SQL Connector (separate from pg8000)
-###############################################################################
-def open_psycopg2_conn():
-    # Load secrets / env consistent with your db_handler
-    cfg = {
-        "instance_connection_name": st.secrets["cloudsql"]["instance_connection_name"],
-        "user": st.secrets["cloudsql"]["user"],
-        "password": st.secrets["cloudsql"]["password"],
-        "db": st.secrets["cloudsql"]["db"],
-    }
-    creds = None
-    if "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_service_account_info(
-            dict(st.secrets["gcp_service_account"])
-        )
-    connector = Connector(credentials=creds) if creds else Connector()
-    # IMPORTANT: use driver "psycopg2"
-    conn = connector.connect(
-        cfg["instance_connection_name"],
-        "psycopg2",
-        user=cfg["user"],
-        password=cfg["password"],
-        db=cfg["db"],
-        connect_timeout=10,
-    )
-    # Keep handles for cleanup
-    conn._cloudsql_connector = connector  # noqa: SLF001
-    return conn
-
-def close_psycopg2_conn(conn):
-    try:
-        conn.close()
-    except Exception:
-        pass
-    try:
-        connector = getattr(conn, "_cloudsql_connector", None)
-        if connector:
-            connector.close()
-    except Exception:
-        pass
-
-###############################################################################
-# 1) Small logging helpers
-###############################################################################
+# ───────────────────────────────────────────────────────────────
+# Debug logger kept in session
+# ───────────────────────────────────────────────────────────────
 if "upload_logs" not in st.session_state:
     st.session_state.upload_logs = []
 
-def log(msg, data=None):
+def log(msg: str, data: dict | None = None):
     st.session_state.upload_logs.append({
         "t": time.strftime("%Y-%m-%d %H:%M:%S"),
         "msg": msg,
-        **({"data": data} if data is not None else {})
+        **({"data": data} if data else {})
     })
 
-def dump_logs_text():
-    lines = []
+def dump_logs_text() -> str:
+    out = []
     for e in st.session_state.upload_logs:
-        d = e.get("data")
-        if d is None:
-            lines.append(f'{e["t"]} | {e["msg"]}')
-        else:
-            lines.append(f'{e["t"]} | {e["msg"]} | {json.dumps(d, ensure_ascii=False)}')
-    return "\n".join(lines)
+        line = f'{e["t"]} | {e["msg"]}'
+        if "data" in e:
+            line += " | " + json.dumps(e["data"], ensure_ascii=False)
+        out.append(line)
+    return "\n".join(out)
 
-###############################################################################
-# 2) Catalog helpers (using your pg8000-backed DatabaseManager)
-###############################################################################
-db = DatabaseManager()
-
+# ───────────────────────────────────────────────────────────────
+# Catalog helpers
+# ───────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=60)
-def list_tables():
+def list_tables() -> pd.DataFrame:
     q = """
       SELECT table_schema, table_name
       FROM information_schema.tables
       WHERE table_schema NOT IN ('pg_catalog','information_schema')
-        AND table_type='BASE TABLE'
+        AND table_type = 'BASE TABLE'
       ORDER BY table_schema, table_name
     """
     df = db.fetch_data(q)
-    return df if not df.empty else pd.DataFrame(columns=["table_schema","table_name"])
+    return df if not df.empty else pd.DataFrame(columns=["table_schema", "table_name"])
 
 @st.cache_data(show_spinner=False, ttl=60)
-def table_columns(schema, table):
+def table_columns(schema: str, table: str) -> pd.DataFrame:
     q = """
       SELECT
         c.ordinal_position,
         c.column_name,
         c.data_type,
         c.is_nullable = 'YES' AS is_nullable,
-        c.column_default
+        c.column_default,
+        c.character_maximum_length,
+        c.numeric_precision,
+        c.numeric_scale
       FROM information_schema.columns c
-      WHERE c.table_schema=%s AND c.table_name=%s
+      WHERE c.table_schema = %s AND c.table_name = %s
       ORDER BY c.ordinal_position
     """
     df = db.fetch_data(q, (schema, table))
     if df.empty:
-        return pd.DataFrame(columns=["ordinal_position","column_name","data_type","is_nullable","column_default"])
+        return pd.DataFrame(columns=[
+            "ordinal_position", "column_name", "data_type", "is_nullable",
+            "column_default", "character_maximum_length",
+            "numeric_precision", "numeric_scale"
+        ])
     return df
 
 @st.cache_data(show_spinner=False, ttl=60)
-def primary_keys(schema, table):
+def primary_keys(schema: str, table: str) -> list[str]:
     q = """
       SELECT kcu.column_name
       FROM information_schema.table_constraints tc
       JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name=kcu.constraint_name
-       AND tc.table_schema=kcu.table_schema
-      WHERE tc.constraint_type='PRIMARY KEY'
-        AND tc.table_schema=%s AND tc.table_name=%s
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema   = kcu.table_schema
+      WHERE tc.constraint_type = 'PRIMARY KEY'
+        AND tc.table_schema = %s AND tc.table_name = %s
       ORDER BY kcu.ordinal_position
     """
     df = db.fetch_data(q, (schema, table))
     return df["column_name"].tolist() if not df.empty and "column_name" in df.columns else []
 
-###############################################################################
-# 3) CSV + mapping helpers
-###############################################################################
-def normalize(s: str) -> str:
+@st.cache_data(show_spinner=False, ttl=60)
+def unique_constraints(schema: str, table: str) -> list[list[str]]:
+    """
+    Return a list of UNIQUE constraint column lists, including PK (which is unique).
+    """
+    q = """
+      SELECT c.conname,
+             ARRAY_AGG(a.attname ORDER BY a.attnum) AS cols
+      FROM   pg_constraint c
+      JOIN   pg_class t  ON t.oid = c.conrelid
+      JOIN   pg_namespace n ON n.oid = t.relnamespace
+      JOIN   unnest(c.conkey) WITH ORDINALITY AS ck(attnum, ord) ON TRUE
+      JOIN   pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum
+      WHERE  n.nspname = %s
+        AND  t.relname = %s
+        AND  c.contype IN ('p','u')  -- primary or unique
+      GROUP BY c.conname
+      ORDER BY c.conname
+    """
+    df = db.fetch_data(q, (schema, table))
+    if df.empty or "cols" not in df.columns:
+        return []
+    # pg8000 returns arrays as Python lists already
+    return [list(row) for row in df["cols"].tolist()]
+
+# ───────────────────────────────────────────────────────────────
+# CSV + mapping helpers
+# ───────────────────────────────────────────────────────────────
+def normalize_name(s: str) -> str:
     s = (s or "").strip()
-    s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
-    return s.lower().replace(" ","_")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return s.lower().replace(" ", "_")
 
 def automap(csv_cols, table_cols):
-    norm = {normalize(c): c for c in csv_cols}
-    return {t: norm.get(normalize(t)) for t in table_cols}
+    norm_csv = {normalize_name(c): c for c in csv_cols}
+    return {t: norm_csv.get(normalize_name(t)) for t in table_cols}
 
 def read_csv(uploaded, delimiter, encoding, has_header, quotechar):
     raw = uploaded.read()
-    opts = dict(sep=delimiter, encoding=encoding, dtype=str, keep_default_na=False, na_values=[""], quotechar=quotechar)
+    opts = dict(sep=delimiter or ",", encoding=encoding or "utf-8", dtype=str,
+                keep_default_na=False, na_values=[""], quotechar=quotechar or '"')
     if has_header:
         return pd.read_csv(io.BytesIO(raw), **opts)
     df = pd.read_csv(io.BytesIO(raw), header=None, **opts)
@@ -156,87 +138,84 @@ def read_csv(uploaded, delimiter, encoding, has_header, quotechar):
     return df
 
 def coerce_cell(v):
-    if v is None: return None
-    if isinstance(v,str):
+    if v is None:
+        return None
+    if isinstance(v, str):
         v = v.strip()
-        return None if v=="" else v
+        return None if v == "" else v
     return v
 
-def required_columns(cols_df, pks):
-    req=[]
-    for _,r in cols_df.iterrows():
-        c=r["column_name"]; not_null=not bool(r["is_nullable"]); has_def=str(r.get("column_default") or "")!=""
-        if c in pks and not has_def: req.append(c)
-        elif not_null and not has_def: req.append(c)
-    return req
-
 def example_for_type(dt: str) -> str:
-    dt=(dt or "").lower()
+    dt = (dt or "").lower()
     if "int" in dt: return "123"
     if "numeric" in dt or "decimal" in dt: return "9.99"
     if "double" in dt or "real" in dt or "float" in dt: return "3.14"
     if "bool" in dt: return "true"
-    if dt=="date": return "2025-01-01"
+    if dt == "date": return "2025-01-01"
     if "timestamp" in dt: return "2025-01-01 12:34:56"
-    if dt=="time": return "12:34:56"
+    if dt == "time": return "12:34:56"
     if "uuid" in dt: return "00000000-0000-0000-0000-000000000000"
     if "json" in dt: return '{"key":"value"}'
     if "char" in dt or "text" in dt: return "example"
     return "value"
 
-def csv_template(cols_df):
-    if cols_df.empty: return pd.DataFrame([{"example_column":"value"},{"example_column":"value"}])
-    row={}
-    for _,r in cols_df.iterrows():
+def csv_template(cols_df: pd.DataFrame) -> pd.DataFrame:
+    if cols_df.empty:
+        return pd.DataFrame([{"example_column": "value"}, {"example_column": "value"}])
+    row = {}
+    for _, r in cols_df.iterrows():
         row[r["column_name"]] = example_for_type(r["data_type"])
-    return pd.DataFrame([row,row])
+    return pd.DataFrame([row, row])
 
-###############################################################################
-# 4) UI controls
-###############################################################################
-c1,c2,c3 = st.columns([1.5,1,1])
-with c1:
-    delim = st.text_input("Delimiter", value=",", help="e.g. , ; | \\t").replace("\\t","\t")
+# ───────────────────────────────────────────────────────────────
+# Page controls
+# ───────────────────────────────────────────────────────────────
+cA, cB, cC = st.columns([1.5, 1, 1])
+with cA:
+    delim = st.text_input("Delimiter", value=",", help="e.g. , ; | \\t").replace("\\t", "\t")
     enc = st.text_input("Encoding", value="utf-8")
-with c2:
+with cB:
     quotechar = st.text_input("Quote char", value='"')
     has_header = st.checkbox("CSV has header row", value=True)
-with c3:
-    chunk_rows = st.number_input("COPY batch rows (lines per stream)", min_value=500, max_value=100000, value=20000, step=500,
-                                 help="COPY streams the whole CSV; this value only affects progress jumps. 20,000 works well.")
+with cC:
+    # Good default for ~25k rows
+    chunk_size = st.number_input("Insert chunk size", min_value=200, max_value=20000, value=2000, step=200)
 
 tables = list_tables()
 schemas = sorted(tables["table_schema"].unique().tolist())
-schema = st.selectbox("Schema", options=schemas, index=schemas.index("public") if "public" in schemas else 0)
-t_subset = tables[tables["table_schema"]==schema]
-table = st.selectbox("Table", options=t_subset["table_name"].tolist() or ["— none —"])
+schema = st.selectbox("Schema", options=schemas, index=(schemas.index("public") if "public" in schemas else 0))
+subset = tables[tables["table_schema"] == schema]
+table = st.selectbox("Table", options=subset["table_name"].tolist() or ["— none —"])
 
 with st.expander("🐞 Debug panel", expanded=False):
     st.code(dump_logs_text() or "No logs yet.", language="text")
     st.download_button("⬇️ Download logs", data=(dump_logs_text() or "No logs."),
-                       file_name="upload_debug_logs.txt", mime="text/plain")
+                       file_name="upload_debug_logs.txt", mime="text/plain", key="dbg_dl_1")
 
-if not table or table=="— none —":
-    st.info("Pick a schema & table.")
+if not table or table == "— none —":
+    st.info("Pick a schema and table to continue.")
     st.stop()
 
 cols_df = table_columns(schema, table)
 pks = primary_keys(schema, table)
-req_cols = required_columns(cols_df, pks)
+uniques = unique_constraints(schema, table)  # list of unique column lists
 tmpl = csv_template(cols_df)
 
 st.subheader("📘 Data dictionary")
 dd = cols_df.copy()
 if not dd.empty:
-    dd.insert(1,"is_primary_key", dd["column_name"].isin(pks))
-st.dataframe(dd if not dd.empty else pd.DataFrame([{"info":"No columns found."}]), use_container_width=True, hide_index=True)
+    dd.insert(1, "is_primary_key", dd["column_name"].isin(pks))
+st.dataframe(dd if not dd.empty else pd.DataFrame([{"info": "No columns found."}]),
+             use_container_width=True, hide_index=True)
 
 with st.expander("📄 CSV Template & Examples", expanded=True):
     st.write("**Template preview (example values):**")
     st.dataframe(tmpl, use_container_width=True)
     st.download_button("⬇️ Download CSV template",
                        data=tmpl.to_csv(index=False).encode("utf-8"),
-                       file_name=f"{schema}.{table}.template.csv", mime="text/csv")
+                       file_name=f"{schema}.{table}.template.csv",
+                       mime="text/csv",
+                       key="tmpl_dl_1")
 
 uploaded = st.file_uploader("Choose CSV", type=["csv"])
 if not uploaded:
@@ -255,11 +234,14 @@ st.dataframe(df_csv.head(50), use_container_width=True)
 
 # Mapping UI
 st.subheader("Map CSV columns → table columns")
-table_cols = cols_df["column_name"].tolist()
-default_map = automap(df_csv.columns.tolist(), table_cols)
+table_cols = cols_df["column_name"].tolist() if "column_name" in cols_df.columns else []
+if not table_cols:
+    st.error("This table has no columns or metadata couldn't be read.")
+    st.stop()
 
-mapping={}
-m1,m2 = st.columns([2,2])
+default_map = automap(df_csv.columns.tolist(), table_cols)
+mapping = {}
+m1, m2 = st.columns([2, 2])
 with m1:
     st.caption("Table column → CSV column")
     for tcol in table_cols:
@@ -272,10 +254,36 @@ with m1:
         )
 with m2:
     truncate = st.checkbox("TRUNCATE table before load (danger!)", value=False)
-    on_conflict = st.checkbox("ON CONFLICT DO NOTHING (skip duplicates)", value=True)
-    show_sql = st.checkbox("Show INSERT SQL", value=False)
+    mode = st.radio("On conflict", ["Skip (DO NOTHING)", "Upsert (DO UPDATE)"], index=0)
+    # let user pick the conflict key (from PK/unique combos)
+    conflict_options = [tuple(pks)] if pks else []
+    for combo in uniques:
+        if tuple(combo) not in conflict_options:
+            conflict_options.append(tuple(combo))
+    conflict_label_map = {c: ", ".join(c) if c else "(none)" for c in conflict_options}
+    conflict_target = st.selectbox("Conflict target (unique key)", options=conflict_options or [()],
+                                   format_func=lambda x: conflict_label_map.get(x, "(none)"))
+    # show SQL if wanted
+    show_sql = st.checkbox("Show generated INSERT/UPSERT SQL", value=False)
 
-target_cols = [c for c in table_cols if mapping.get(c) and mapping[c]!="— skip —"]
+target_cols = [c for c in table_cols if mapping.get(c) and mapping[c] != "— skip —"]
+
+# Required column check
+def required_columns(cols_df: pd.DataFrame, pks: list[str]) -> list[str]:
+    req = []
+    if cols_df.empty:
+        return req
+    for _, r in cols_df.iterrows():
+        c = r["column_name"]
+        not_null = not bool(r.get("is_nullable", False))
+        has_default = str(r.get("column_default", "") or "") != ""
+        if c in pks and not has_default:
+            req.append(c)
+        elif not_null and not has_default:
+            req.append(c)
+    return req
+
+req_cols = required_columns(cols_df, pks)
 missing_req = [c for c in req_cols if c not in target_cols]
 if missing_req:
     st.error(f"Required columns not mapped: {', '.join(missing_req)}")
@@ -284,7 +292,7 @@ if not target_cols:
     st.warning("Map at least one column.")
     st.stop()
 
-# Build a mapped DataFrame in the target column order
+# Build mapped DataFrame in target column order
 mapped = pd.DataFrame()
 for tcol in target_cols:
     mapped[tcol] = df_csv[mapping[tcol]].map(coerce_cell)
@@ -293,15 +301,65 @@ st.write("**Mapped Preview**")
 st.dataframe(mapped.head(50), use_container_width=True)
 st.caption(f"{len(mapped):,} rows → {schema}.{table} columns {target_cols}")
 
-# INSERT SQL (staging -> target)
+# Build INSERT / UPSERT SQL
 cols_quoted = ", ".join([f'"{c}"' for c in target_cols])
-insert_sql = f'INSERT INTO "{schema}"."{table}" ({cols_quoted}) SELECT {cols_quoted} FROM {{staging}}'
-if on_conflict:
-    insert_sql += " ON CONFLICT DO NOTHING"
-if show_sql:
-    st.code(insert_sql.replace("{staging}", "<staging_table>"), language="sql")
+placeholders = ", ".join(["%s"] * len(target_cols))
+base_sql = f'INSERT INTO "{schema}"."{table}" ({cols_quoted}) VALUES ({placeholders})'
 
-go = st.button("🚀 Start upload (COPY)")
+sql = base_sql
+if mode.startswith("Skip"):
+    sql += " ON CONFLICT DO NOTHING"
+else:
+    # Upsert: need a conflict target and update set
+    if not conflict_target or not all(c in target_cols for c in conflict_target):
+        st.warning("For UPSERT, the conflict target must be a unique/PK column (and be mapped). "
+                   "Defaulting to DO NOTHING.")
+        sql += " ON CONFLICT DO NOTHING"
+    else:
+        conflict_cols = ", ".join([f'"{c}"' for c in conflict_target])
+        # Update all mapped columns EXCEPT the conflict key columns
+        update_cols = [c for c in target_cols if c not in conflict_target]
+        if update_cols:
+            set_clause = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
+        else:
+            # If everything is in conflict target, DO UPDATE does nothing → fall back to DO NOTHING
+            set_clause = None
+        if set_clause:
+            sql += f" ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
+        else:
+            sql += " ON CONFLICT DO NOTHING"
+
+if show_sql:
+    st.code(sql, language="sql")
+
+# Row-by-row debug (first N) — helps diagnose conflicts/format
+row_debug = st.checkbox("Row-by-row debug on first N", value=False)
+row_debug_n = st.number_input("N", min_value=1, max_value=200, value=25, step=1, disabled=not row_debug)
+
+if row_debug:
+    st.info("Debugging the first N rows individually. This is slower, for diagnosis.")
+    results = []
+    for idx, row in mapped.head(int(row_debug_n)).iterrows():
+        params = tuple(row[c] for c in target_cols)
+        cur = db.conn.cursor()
+        try:
+            cur.execute("SET LOCAL statement_timeout = 15000;")
+            cur.execute(sql + " RETURNING true", params)
+            inserted = cur.fetchone() is not None
+            db.conn.commit()
+            results.append({"row": int(idx + 1), "inserted": inserted})
+        except Exception as e:
+            db.conn.rollback()
+            results.append({"row": int(idx + 1), "inserted": False, "error": str(e)})
+        finally:
+            cur.close()
+    st.dataframe(pd.DataFrame(results), use_container_width=True)
+    log("row_debug", {"results": results})
+
+# ───────────────────────────────────────────────────────────────
+# Execute upload
+# ───────────────────────────────────────────────────────────────
+go = st.button("🚀 Start upload")
 if not go:
     st.stop()
 
@@ -309,78 +367,77 @@ if truncate:
     st.error("You chose TRUNCATE (will delete ALL rows first).")
     if not st.checkbox("I understand, proceed with TRUNCATE"):
         st.stop()
+    try:
+        db.execute_command(f'TRUNCATE TABLE "{schema}"."{table}" RESTART IDENTITY CASCADE;')
+        log("truncate_done", {"schema": schema, "table": table})
+    except Exception as e:
+        st.error(f"TRUNCATE failed: {e}")
+        log("truncate_failed", {"error": str(e)})
+        st.stop()
 
-###############################################################################
-# 5) BULK LOAD VIA STAGING + COPY
-###############################################################################
-start_total = time.time()
-staging = f'__staging_{table}_{uuid.uuid4().hex[:8]}'
-log("upload_start", {"table": f"{schema}.{table}", "staging": staging, "rows": len(mapped)})
-
-# Generate a CSV string from the mapped DF (header included for COPY)
-csv_buf = io.StringIO()
-mapped.to_csv(csv_buf, index=False)
-csv_buf.seek(0)
+total_rows = len(mapped)
+chunks = int(math.ceil(total_rows / int(chunk_size))) if total_rows else 0
+log("upload_start", {"schema": schema, "table": table, "rows": total_rows, "chunk_size": int(chunk_size), "chunks": chunks})
 
 prog = st.progress(0.0)
 status = st.empty()
+inserted_total = 0
+t_all = time.time()
 
-conn = None
 try:
-    conn = open_psycopg2_conn()
-    cur = conn.cursor()
+    for i in range(chunks):
+        start_idx = i * int(chunk_size)
+        end_idx = min((i + 1) * int(chunk_size), total_rows)
+        batch = mapped.iloc[start_idx:end_idx]
 
-    # Optional truncate
-    if truncate:
+        # Robust tuple params for executemany
+        params = list(batch[target_cols].itertuples(index=False, name=None))
+
+        cur = db.conn.cursor()
         t0 = time.time()
-        cur.execute(f'TRUNCATE TABLE "{schema}"."{table}" RESTART IDENTITY CASCADE;')
-        conn.commit()
-        log("truncate_done", {"elapsed_sec": round(time.time()-t0, 3)})
+        try:
+            cur.execute("SET LOCAL statement_timeout = 120000;")
+            cur.executemany(sql, params)
+            rowcount = cur.rowcount  # driver may report last statement
+        except Exception as e:
+            db.conn.rollback()
+            cur.close()
+            log("chunk_failed", {"chunk": i + 1, "rows": len(batch), "range": [start_idx + 1, end_idx], "error": str(e)})
+            st.error(f"Chunk {i+1}/{chunks} failed (rows {start_idx+1}-{end_idx}). {e}")
+            st.stop()
+        else:
+            db.conn.commit()
+            cur.close()
+            elapsed = time.time() - t0
+            rps = len(batch) / elapsed if elapsed > 0 else None
+            inserted_total += len(batch)  # attempted
+            log("chunk_ok", {
+                "chunk": i + 1,
+                "rows": len(batch),
+                "range": [start_idx + 1, end_idx],
+                "elapsed_sec": round(elapsed, 3),
+                "rows_per_sec": round(rps, 1) if rps else None,
+                "driver_rowcount": rowcount
+            })
 
-    # 1) Create staging table with TEXT columns
-    t0 = time.time()
-    cols_def = ", ".join([f'"{c}" TEXT' for c in target_cols])
-    cur.execute(f'CREATE TEMP TABLE "{staging}" ({cols_def}) ON COMMIT DROP;')
-    conn.commit()
-    log("staging_created", {"staging": staging, "elapsed_sec": round(time.time()-t0, 3)})
+        prog.progress((i + 1) / max(chunks, 1))
+        status.info(f"Chunk {i+1}/{chunks}: attempted {len(batch):,} rows "
+                    f"(total attempted {inserted_total:,}/{total_rows:,}).")
 
-    # 2) COPY CSV (header) into staging
-    t0 = time.time()
-    copy_sql = f'COPY "{staging}" ({cols_quoted}) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER \'{delim if delim!="\t" else "\\t"}\', QUOTE \'{quotechar}\')'
-    cur.copy_expert(copy_sql, csv_buf)
-    conn.commit()
-    log("copy_done", {"elapsed_sec": round(time.time()-t0, 3)})
-
-    # 3) Insert from staging into real table
-    t0 = time.time()
-    cur.execute(insert_sql.format(staging=f'"{staging}"'))
-    inserted = cur.rowcount  # rows inserted (skipped conflicts aren't counted)
-    conn.commit()
-    log("insert_done", {"inserted": inserted, "elapsed_sec": round(time.time()-t0, 3)})
+    total_elapsed = time.time() - t_all
+    rps_total = inserted_total / total_elapsed if total_elapsed > 0 else None
+    log("upload_done", {"attempted_total": inserted_total, "elapsed_sec": round(total_elapsed, 2), "rows_per_sec": round(rps_total or 0, 1)})
 
     prog.progress(1.0)
-    status.info("Finalizing…")
-
-    total_elapsed = time.time() - start_total
-    st.success(f"Completed. Inserted ~{inserted:,} rows into {schema}.{table} in {total_elapsed:.2f}s.")
+    st.success(f"Done! Attempted {inserted_total:,} rows in {total_elapsed:.2f}s "
+               f"({(rps_total or 0):.0f} rows/sec). Check Debug panel for details.")
     st.balloons()
 
 except Exception as e:
-    if conn:
-        try: conn.rollback()
-        except Exception: pass
+    log("upload_exception", {"error": str(e)})
     st.error(f"Upload failed: {e}")
-    log("upload_failed", {"error": str(e)})
-finally:
-    if conn:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        close_psycopg2_conn(conn)
 
-# Debug panel refresh
 with st.expander("🐞 Debug panel", expanded=False):
     st.code(dump_logs_text() or "No logs yet.", language="text")
     st.download_button("⬇️ Download logs", data=(dump_logs_text() or "No logs."),
-                       file_name="upload_debug_logs.txt", mime="text/plain")
+                       file_name="upload_debug_logs.txt", mime="text/plain", key="dbg_dl_2")
