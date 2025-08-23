@@ -1,129 +1,65 @@
 # pages/2_Edit_Database.py
-from __future__ import annotations
-
 import time
-from typing import List, Tuple, Optional, Iterable, Mapping, Any
+from typing import List, Tuple
 
 import pandas as pd
-import sqlalchemy as sa
 import streamlit as st
-from db_handler import DatabaseManager  # uses the revised manager above
-
+from db_handler import DatabaseManager
 
 st.set_page_config(page_title="Edit / Inspect Database", layout="wide")
 st.title("Edit / Inspect Database")
 
+db = DatabaseManager()  # Cloud SQL via pg8000
 
-# ───────────────────────────
-# Connection management
-# ───────────────────────────
-
-@st.cache_resource(show_spinner=False)
-def get_db() -> DatabaseManager:
-    """
-    Cache the DB manager as a resource so reruns don't create new connections.
-    IMPORTANT: We don't connect here; engine connects lazily on first use.
-    """
-    # If you need to pass a config dict, do it here:
-    # cfg = st.secrets["cloudsql"]  # or however you load it
-    # return DatabaseManager(cfg)
-    return DatabaseManager(cfg=st.secrets["cloudsql"])  # adjust to your secrets layout
-
-
-def _pg8000_err_dict(exc: Exception) -> Optional[dict]:
-    """
-    Extract the pg8000 error dict from a wrapped SQLAlchemy/DBAPI exception.
-    """
-    # SQLAlchemy DBAPIError typically exposes .orig
-    err = getattr(exc, "orig", exc)
-    try:
-        first = err.args[0]
-        if isinstance(first, dict):
-            return first
-    except Exception:
-        pass
-    return None
-
-
-def _is_conn_slots_exhausted(exc: Exception) -> bool:
-    d = _pg8000_err_dict(exc)
-    return bool(d and d.get("C") == "53300")
-
-
-def _friendly_error(exc: Exception) -> str:
-    d = _pg8000_err_dict(exc)
-    if not d:
-        return str(exc)
-    code = d.get("C", "")
-    msg = d.get("M", str(exc))
-    detail = d.get("D", "")
-    rel = d.get("t", "")
-    name = d.get("n", "")
-    extra = []
-    if detail:
-        extra.append(detail)
-    if rel:
-        extra.append(f"table={rel}")
-    if name:
-        extra.append(f"constraint={name}")
-    suffix = (" • " + " • ".join(extra)) if extra else ""
-    return f"[{code}] {msg}{suffix}"
-
-
-def _reset_db_resource():
-    try:
-        db = get_db()
-        db.close()
-    except Exception:
-        pass
-    get_db.clear()
-
-
-with st.sidebar:
-    st.subheader("Connection")
-    if st.button("Disconnect / reset DB", type="secondary", use_container_width=True):
-        _reset_db_resource()
-        st.success("Connection pool disposed. Your slot has been released.")
-
-
-# ───────────────────────────
-# Schema helpers (cached)
-# ───────────────────────────
+# ───────── Schema overview ─────────
+st.subheader("Schema overview")
 
 @st.cache_data(show_spinner=False, ttl=60)
-def get_available_schemas(db_key: str) -> List[str]:
+def get_available_schemas() -> List[str]:
     q = """
         SELECT schema_name
         FROM information_schema.schemata
         WHERE schema_name NOT IN ('pg_catalog','information_schema')
         ORDER BY schema_name;
     """
-    db = get_db()
     df = db.fetch_data(q)
     return df["schema_name"].tolist() if not df.empty else ["public"]
 
-
 @st.cache_data(show_spinner=False, ttl=60)
-def get_schema_columns(db_key: str, schema: str) -> pd.DataFrame:
+def get_schema_columns(schema: str) -> pd.DataFrame:
     q = """
         SELECT table_name, column_name, data_type
         FROM   information_schema.columns
-        WHERE  table_schema = :schema
+        WHERE  table_schema = %s
         ORDER  BY table_name, ordinal_position;
     """
-    db = get_db()
-    return db.fetch_data(q, {"schema": schema})
+    return db.fetch_data(q, (schema,))
 
+schemas = get_available_schemas()
+schema = st.selectbox(
+    "Schema",
+    schemas or ["public"],
+    index=(schemas or ["public"]).index("public") if "public" in (schemas or []) else 0,
+)
 
-# We key caches by a short "db_key" so if you switch DBs/users, caches separate.
-# Here we derive it from secrets minimally.
-_db_key = f'{st.secrets["cloudsql"].get("instance_connection_name","")}/{st.secrets["cloudsql"].get("db","")}/{st.secrets["cloudsql"].get("user","")}'
+schema_rows = get_schema_columns(schema)
+if not schema_rows.empty:
+    by_table: dict[str, list[str]] = {}
+    for _, r in schema_rows.iterrows():
+        t, c, d = r["table_name"], r["column_name"], r["data_type"]
+        by_table.setdefault(t, []).append(f"{c} ({d})")
+    for t, cols in by_table.items():
+        st.markdown(f"**{t}**")
+        st.write(", ".join(cols))
+else:
+    st.info("No tables found in this schema.")
 
+st.caption(
+    "Tip: Use single-transaction mode to run several statements atomically, "
+    "or autocommit to run each statement independently."
+)
 
-# ───────────────────────────
-# Safe SQL splitter
-# ───────────────────────────
-
+# ───────── Helpers ─────────
 def split_sql_statements(sql_text: str) -> List[str]:
     """Split SQL into statements (uses sqlparse if available; fallback otherwise)."""
     try:
@@ -176,130 +112,84 @@ def split_sql_statements(sql_text: str) -> List[str]:
             out.append(tail)
         return [x for x in out if x]
 
-
-# ───────────────────────────
-# Timeouts & execution
-# ───────────────────────────
-
-def _set_timeouts(conn: sa.Connection, lock_timeout_ms: int, statement_timeout_ms: int, in_txn: bool) -> None:
-    """
-    If inside a transaction, use SET LOCAL so values reset on COMMIT/ROLLBACK.
-    Otherwise use session-level SET and explicitly reset afterwards.
-    """
+def _set_timeouts(cur, lock_timeout_ms: int, statement_timeout_ms: int, in_txn: bool):
     if in_txn:
-        conn.exec_driver_sql(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms';")
-        conn.exec_driver_sql(f"SET LOCAL statement_timeout = '{int(statement_timeout_ms)}ms';")
-        conn.exec_driver_sql("SET LOCAL idle_in_transaction_session_timeout = '15000ms';")
+        cur.execute(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms';")
+        cur.execute(f"SET LOCAL statement_timeout = '{int(statement_timeout_ms)}ms';")
+        cur.execute("SET LOCAL idle_in_transaction_session_timeout = '15000ms';")
+        return False
     else:
-        conn.exec_driver_sql(f"SET lock_timeout = '{int(lock_timeout_ms)}ms';")
-        conn.exec_driver_sql(f"SET statement_timeout = '{int(statement_timeout_ms)}ms';")
+        cur.execute(f"SET lock_timeout = '{int(lock_timeout_ms)}ms';")
+        cur.execute(f"SET statement_timeout = '{int(statement_timeout_ms)}ms';")
+        return True
 
+def _reset_timeouts(cur):
+    cur.execute("RESET lock_timeout;")
+    cur.execute("RESET statement_timeout;")
 
-def _reset_timeouts(conn: sa.Connection) -> None:
-    conn.exec_driver_sql("RESET lock_timeout;")
-    conn.exec_driver_sql("RESET statement_timeout;")
-
+def _pg8000_err_to_text(e: Exception) -> str:
+    try:
+        first = e.args[0]
+        if isinstance(first, dict):
+            code = first.get("C", "")
+            detail = first.get("D", "")
+            msgtxt = first.get("M", str(e))
+            name = first.get("n", "")
+            rel = first.get("t", "")
+            return f"[{code}] {msgtxt}" + (f" • {detail}" if detail else "") + (f" • table={rel}" if rel else "") + (f" • constraint={name}" if name else "")
+    except Exception:
+        pass
+    return str(e)
 
 def run_one_statement(
-    engine: sa.Engine,
     sql: str,
     lock_timeout_ms: int,
     statement_timeout_ms: int,
-    max_rows: Optional[int],
+    max_rows: int | None,
     explain: bool,
     in_txn: bool,
 ) -> Tuple[str, object, float]:
     """
     Returns: (kind, payload, elapsed_sec)
-      kind="result" -> payload is DataFrame (or list of EXPLAIN rows)
-      kind="ok"     -> payload is status string (rowcount)
+      kind="result" -> payload is DataFrame
+      kind="ok"     -> payload is status string (built from rowcount)
     """
-    to_exec = f"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) {sql}" if explain else sql
+    to_exec = sql if not explain else f"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) {sql}"
+
     start = time.perf_counter()
+    cur = db.conn.cursor()
+    needs_reset = False
+    try:
+        needs_reset = _set_timeouts(cur, lock_timeout_ms, statement_timeout_ms, in_txn)
+        cur.execute(to_exec)
 
-    if in_txn:
-        # Use a single transaction context supplied by the caller.
-        # Here we assume we're already in a transaction; just run the statement.
-        with engine.connect() as conn:
-            with conn.begin():  # explicit txn
-                _set_timeouts(conn, lock_timeout_ms, statement_timeout_ms, in_txn=True)
-                result = conn.exec_driver_sql(to_exec)
-                payload, kind = _consume_result(result, max_rows)
-    else:
-        # Per-statement transaction to mimic "autocommit per statement" semantics.
-        with engine.connect() as conn:
-            with conn.begin():
-                _set_timeouts(conn, lock_timeout_ms, statement_timeout_ms, in_txn=True)
-                result = conn.exec_driver_sql(to_exec)
-                payload, kind = _consume_result(result, max_rows)
-            # Timeouts were LOCAL; automatically reset on commit.
+        if cur.description:  # query returned rows
+            rows = cur.fetchall()
+            cols = [c[0] for c in cur.description]
+            if max_rows is not None and max_rows > 0 and len(rows) > max_rows:
+                rows = rows[:max_rows]
+            payload = pd.DataFrame(rows, columns=cols)
+            kind = "result"
+        else:
+            rc = cur.rowcount
+            # pg8000 cursor has no statusmessage; craft a friendly message
+            if rc in (-1, None):
+                payload = "Command executed."
+            else:
+                payload = f"Command executed • rowcount={rc}"
+            kind = "ok"
 
-    elapsed = time.perf_counter() - start
-    return (kind, payload, elapsed)
+        elapsed = time.perf_counter() - start
+        return (kind, payload, elapsed)
+    finally:
+        try:
+            if needs_reset:
+                _reset_timeouts(cur)
+        except Exception:
+            pass
+        cur.close()
 
-
-def _consume_result(result: sa.CursorResult, max_rows: Optional[int]) -> Tuple[object, str]:
-    if result.returns_rows:
-        rows = result.fetchall()
-        cols = result.keys()
-        if max_rows is not None and max_rows > 0 and len(rows) > max_rows:
-            rows = rows[:max_rows]
-        # EXPLAIN typically returns one column "QUERY PLAN"; keep DataFrame for consistency
-        df = pd.DataFrame(rows, columns=cols)
-        return df, "result"
-    else:
-        rc = result.rowcount
-        msg = "Command executed." if (rc in (-1, None)) else f"Command executed • rowcount={rc}"
-        return msg, "ok"
-
-
-# ───────────────────────────
-# UI – Schema overview
-# ───────────────────────────
-
-st.subheader("Schema overview")
-
-try:
-    schemas = get_available_schemas(_db_key)
-    schema = st.selectbox(
-        "Schema",
-        schemas or ["public"],
-        index=(schemas or ["public"]).index("public") if "public" in (schemas or []) else 0,
-    )
-
-    schema_rows = get_schema_columns(_db_key, schema)
-    if not schema_rows.empty:
-        by_table: dict[str, list[str]] = {}
-        for _, r in schema_rows.iterrows():
-            t, c, d = r["table_name"], r["column_name"], r["data_type"]
-            by_table.setdefault(t, []).append(f"{c} ({d})")
-        for t, cols in by_table.items():
-            st.markdown(f"**{t}**")
-            st.write(", ".join(cols))
-    else:
-        st.info("No tables found in this schema.")
-except Exception as e:
-    if _is_conn_slots_exhausted(e):
-        st.error("Database is out of available connection slots (code 53300).")
-        with st.expander("What you can do", expanded=True):
-            st.markdown(
-                "- Close extra app tabs/sessions, then click **Disconnect / reset DB** in the sidebar.\n"
-                "- Keep this app’s pool small (already limited to 1 connection).\n"
-                "- Consider adding PgBouncer or increasing your Cloud SQL instance size if this recurs."
-            )
-    else:
-        st.error(_friendly_error(e))
-    st.stop()
-
-st.caption(
-    "Tip: Use single-transaction mode to run several statements atomically, "
-    "or per-statement transactions to run each statement independently."
-)
-
-# ───────────────────────────
-# UI – SQL Runner
-# ───────────────────────────
-
+# ───────── SQL Runner UI ─────────
 st.subheader("Run arbitrary SQL")
 
 with st.expander("Execution settings", expanded=True):
@@ -308,7 +198,7 @@ with st.expander("Execution settings", expanded=True):
         single_txn = st.checkbox(
             "Run all statements in a single transaction (rollback on first error)",
             value=False,
-            help="If unchecked, each statement runs in its own short transaction.",
+            help="If unchecked, each statement runs & commits independently (autocommit).",
         )
     with col2:
         lock_timeout_ms = st.number_input(
@@ -328,9 +218,9 @@ with st.expander("Execution settings", expanded=True):
         )
     with col5:
         explain = st.checkbox(
-            "EXPLAIN ANALYZE (executes the query)",
+            "EXPLAIN ANALYZE (read-only)",
             value=False,
-            help="Prepends EXPLAIN (ANALYZE, BUFFERS, VERBOSE). Note: EXPLAIN ANALYZE actually runs the query.",
+            help="Prepends EXPLAIN (ANALYZE, BUFFERS, VERBOSE) to each statement.",
         )
 
 sql_txt = st.text_area(
@@ -353,73 +243,76 @@ sql_txt = st.text_area(
     ),
 )
 
-if st.button("Run SQL", type="primary"):
+if st.button("Run SQL"):
     stmts = split_sql_statements(sql_txt or "")
     if not stmts:
         st.warning("No SQL statements detected.")
         st.stop()
 
-    engine = get_db().engine
-
-    try:
+    with st.spinner(f"Executing {len(stmts)} statement(s)…"):
         if single_txn:
-            # Run all in one transaction; on first error, rollback and stop.
-            with engine.connect() as conn:
-                with conn.begin():
-                    for idx, stmt in enumerate(stmts, start=1):
-                        with st.container(border=True):
-                            st.markdown(f"**Statement {idx}**")
-                            st.code(stmt, language="sql")
-                            _set_timeouts(conn, lock_timeout_ms, statement_timeout_ms, in_txn=True)
-                            try:
-                                result = conn.exec_driver_sql(
-                                    f"EXPLAIN (ANALYZE, BUFFERS, VERBOSE) {stmt}" if explain else stmt
-                                )
-                                payload, kind = _consume_result(result, int(max_rows))
-                            except Exception as e:
-                                st.error(_friendly_error(e))
-                                st.warning("Transaction rolled back due to the error above.")
-                                raise  # triggers rollback
+            # Run all in one transaction
+            cur = db.conn.cursor()
+            try:
+                cur.execute("BEGIN;")
+                cur.close()
+                for idx, stmt in enumerate(stmts, start=1):
+                    pretty = f"Statement {idx}"
+                    with st.container(border=True):
+                        st.markdown(f"**{pretty}**")
+                        st.code(stmt, language="sql")
+                        try:
+                            kind, payload, elapsed = run_one_statement(
+                                stmt,
+                                lock_timeout_ms,
+                                statement_timeout_ms,
+                                int(max_rows),
+                                explain,
+                                in_txn=True,
+                            )
+                        except Exception as e:
+                            db.conn.rollback()
+                            st.error(_pg8000_err_to_text(e))
+                            st.warning("Transaction rolled back due to the error above.")
+                            st.stop()
 
-                            if kind == "result":
-                                st.dataframe(payload, use_container_width=True)
-                                st.caption(f"Returned {len(payload)} row(s)")
-                            else:
-                                st.success(payload)
+                        if kind == "result":
+                            st.dataframe(payload, use_container_width=True)
+                            st.caption(f"Returned {len(payload)} row(s) • {elapsed*1000:.0f} ms")
+                        else:
+                            st.success(f"{payload} • {elapsed*1000:.0f} ms")
+                db.conn.commit()
+            finally:
+                try:
+                    cur = db.conn.cursor()
+                    cur.execute("END;")
+                    cur.close()
+                except Exception:
+                    pass
         else:
-            # Each statement gets its own short transaction (mimics autocommit per statement).
+            # Autocommit per statement
             for idx, stmt in enumerate(stmts, start=1):
+                pretty = f"Statement {idx}"
                 with st.container(border=True):
-                    st.markdown(f"**Statement {idx}**")
+                    st.markdown(f"**{pretty}**")
                     st.code(stmt, language="sql")
                     try:
-                        kind, payload, _elapsed = run_one_statement(
-                            engine,
+                        kind, payload, elapsed = run_one_statement(
                             stmt,
-                            int(lock_timeout_ms),
-                            int(statement_timeout_ms),
+                            lock_timeout_ms,
+                            statement_timeout_ms,
                             int(max_rows),
-                            bool(explain),
+                            explain,
                             in_txn=False,
                         )
+                        db.conn.commit()
                     except Exception as e:
-                        st.error(_friendly_error(e))
+                        db.conn.rollback()
+                        st.error(_pg8000_err_to_text(e))
                         continue
 
                     if kind == "result":
                         st.dataframe(payload, use_container_width=True)
-                        st.caption(f"Returned {len(payload)} row(s)")
+                        st.caption(f"Returned {len(payload)} row(s) • {elapsed*1000:.0f} ms")
                     else:
-                        st.success(payload)
-    except Exception as outer:
-        # Handle batch-level connection exhaustion or other fatal errors once.
-        if _is_conn_slots_exhausted(outer):
-            st.error("Database is out of available connection slots (code 53300).")
-            with st.expander("What you can do", expanded=True):
-                st.markdown(
-                    "- Close extra app tabs/sessions, then click **Disconnect / reset DB** in the sidebar.\n"
-                    "- This page keeps only one connection in its pool. If the error persists, other clients are likely consuming the slots.\n"
-                    "- Consider PgBouncer or increasing `max_connections` by sizing up your instance."
-                )
-        else:
-            st.error(_friendly_error(outer))
+                        st.success(f"{payload} • {elapsed*1000:.0f} ms")
