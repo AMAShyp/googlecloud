@@ -1,6 +1,15 @@
+# Core app framework
 streamlit==1.45.0
-psycopg2-binary
 pandas
+
+# Database stack (Cloud SQL Connector + pg8000 via SQLAlchemy)
+sqlalchemy>=2.0
+cloud-sql-python-connector[pg8000]>=1.11.1
+pg8000>=1.31.2
+google-auth>=2.30.0
+sqlparse  # optional but recommended for nicer SQL splitting
+
+# Your existing app deps
 xlsxwriter
 openpyxl
 authlib>=1.3.2
@@ -16,6 +25,3 @@ matplotlib
 streamlit-qrcode-scanner
 streamlit-plotly-events
 pydeck
-cloud-sql-python-connector[pg8000]>=1.11.1
-pg8000>=1.31.2
-psycopg2-binary>=2.9
