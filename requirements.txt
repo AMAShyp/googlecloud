@@ -3,8 +3,6 @@ streamlit==1.45.0
 pandas
 psycopg2>=2.9
 
-# OR (recommended for cloud deployment, precompiled wheels)
-psycopg2-binary>=2.9
 # Database stack (Cloud SQL Connector + pg8000 via SQLAlchemy)
 sqlalchemy>=2.0
 cloud-sql-python-connector[pg8000]>=1.11.1
