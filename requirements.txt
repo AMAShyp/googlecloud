@@ -25,3 +25,9 @@ matplotlib
 streamlit-qrcode-scanner
 streamlit-plotly-events
 pydeck
+# standard build (requires libpq system headers at build time)
+psycopg2>=2.9
+
+# OR (recommended for cloud deployment, precompiled wheels)
+psycopg2-binary>=2.9
+
