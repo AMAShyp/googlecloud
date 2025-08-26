@@ -3,29 +3,3 @@ streamlit==1.45.0
 pandas
 psycopg2>=2.9
 
-# Database stack (Cloud SQL Connector + pg8000 via SQLAlchemy)
-sqlalchemy>=2.0
-cloud-sql-python-connector[pg8000]>=1.11.1
-pg8000>=1.31.2
-google-auth>=2.30.0
-sqlparse  # optional but recommended for nicer SQL splitting
-
-# Your existing app deps
-xlsxwriter
-openpyxl
-authlib>=1.3.2
-bcrypt==4.1.2
-plotly>=5.19
-Pillow>=10.2
-pytest>=7.0
-streamlit-autorefresh
-python-escpos==3.1
-pyusb>=1.2
-pyserial>=3.5
-matplotlib
-streamlit-qrcode-scanner
-streamlit-plotly-events
-pydeck
-# standard build (requires libpq system headers at build time)
-
-
