@@ -1,30 +1,11 @@
-# Core app framework
+# UI + data
 streamlit==1.45.0
 pandas
 
-# PostgreSQL driver (precompiled wheel — avoids pg_config build errors)
+# Direct psycopg2 import in pages/1_Create_Database.py (use wheel to avoid pg_config issues)
 psycopg2-binary>=2.9.10
 
-# Database stack (Cloud SQL Connector + pg8000 via SQLAlchemy)
-sqlalchemy>=2.0
+# Cloud SQL connector stack used by DatabaseManager (pg8000 driver)
 cloud-sql-python-connector[pg8000]>=1.11.1
 pg8000>=1.31.2
 google-auth>=2.30.0
-sqlparse
-
-# Your existing app deps
-xlsxwriter
-openpyxl
-authlib>=1.3.2
-bcrypt==4.1.2
-plotly>=5.19
-Pillow>=10.2
-pytest>=7.0
-streamlit-autorefresh
-python-escpos==3.1
-pyusb>=1.2
-pyserial>=3.5
-matplotlib
-streamlit-qrcode-scanner
-streamlit-plotly-events
-pydeck
