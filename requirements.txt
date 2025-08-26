@@ -1,15 +1,16 @@
 # Core app framework
 streamlit==1.45.0
 pandas
-psycopg2>=2.9
 
+# PostgreSQL driver (precompiled wheel — avoids pg_config build errors)
+psycopg2-binary>=2.9.10
 
 # Database stack (Cloud SQL Connector + pg8000 via SQLAlchemy)
 sqlalchemy>=2.0
 cloud-sql-python-connector[pg8000]>=1.11.1
 pg8000>=1.31.2
 google-auth>=2.30.0
-sqlparse  # optional but recommended for nicer SQL splitting
+sqlparse
 
 # Your existing app deps
 xlsxwriter
@@ -27,5 +28,3 @@ matplotlib
 streamlit-qrcode-scanner
 streamlit-plotly-events
 pydeck
-# standard build (requires libpq system headers at build time)
-
