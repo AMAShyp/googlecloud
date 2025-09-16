@@ -25,7 +25,7 @@ def load_objects(include_views: bool) -> pd.DataFrame:
     # Ensure shaped result
     if df.empty:
         return pd.DataFrame(columns=["table_schema", "table_name", "table_type"])
-    # Some drivers can give lowercase/uppercase inconsistencies; normalize:
+    # Normalize
     for col in ["table_schema", "table_name", "table_type"]:
         if col not in df.columns:
             df[col] = pd.Series(dtype="object")
@@ -49,7 +49,6 @@ def get_columns(schema: str, table: str) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "ordinal_position", "column_name", "data_type", "is_nullable", "column_default"
         ])
-    # Normalize expected columns
     for col in ["ordinal_position", "column_name", "data_type", "is_nullable", "column_default"]:
         if col not in df.columns:
             df[col] = pd.Series(dtype="object")
@@ -64,8 +63,15 @@ def get_row_count(schema: str, table: str) -> int:
 
 @st.cache_data(show_spinner=True, ttl=30)
 def preview_table(schema: str, table: str, limit: int) -> pd.DataFrame:
+    # Limited preview (cached)
     df = db.fetch_data(f'SELECT * FROM "{schema}"."{table}" LIMIT {int(limit)}')
-    # If empty with no columns, return shaped empty DF
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    return df
+
+def preview_table_full(schema: str, table: str) -> pd.DataFrame:
+    # Full table (NO cache on purpose)
+    df = db.fetch_data(f'SELECT * FROM "{schema}"."{table}"')
     if df is None or not isinstance(df, pd.DataFrame):
         return pd.DataFrame()
     return df
@@ -80,7 +86,8 @@ with c2:
     with_counts = st.toggle("Show row counts (slow)", value=False,
                             help="Runs COUNT(*) per table.")
 with c3:
-    default_limit = st.number_input("Preview rows", 5, 1000, 50, 5)
+    default_limit = st.number_input("Preview rows", 5, 1_000_000, 50, 5,
+                                    help="Default number of rows for limited preview.")
 with c4:
     name_filter = st.text_input("Filter name contains", "", label_visibility="collapsed")
 
@@ -148,13 +155,41 @@ with left:
 
     show_cols = st.checkbox("Show columns", True)
     do_preview = st.checkbox("Preview data", True)
-    limit = st.number_input("Limit", 1, 5000, int(default_limit), 10)
 
-    if with_counts:
-        try:
-            st.metric("Row count", f"{get_row_count(schema, table):,}")
-        except Exception as e:
-            st.warning(f"Row count failed: {e}")
+    rows_mode = st.radio(
+        "Rows",
+        options=["Limit", "All"],
+        index=0,
+        horizontal=True,
+        help="Choose 'All' to load the entire table (may be slow / memory heavy)."
+    )
+
+    limit = None
+    if rows_mode == "Limit":
+        limit = st.number_input("Limit", 1, 1_000_000, int(default_limit), 10,
+                                help="Max rows to fetch for preview.")
+    else:
+        st.warning("You are about to load the entire table into memory. "
+                   "For very large tables, this can be slow or crash your browser.", icon="⚠️")
+        # If we already computed counts above, reuse; else ask on demand.
+        est_rows = None
+        if with_counts:
+            try:
+                est_rows = get_row_count(schema, table)
+            except Exception:
+                est_rows = None
+        else:
+            # Offer a quick check
+            if st.checkbox("Estimate row count first", value=True):
+                try:
+                    est_rows = get_row_count(schema, table)
+                except Exception:
+                    est_rows = None
+        if est_rows is not None:
+            st.metric("Row count", f"{est_rows:,}")
+            if est_rows > 200_000:
+                st.error("This table is very large (>200k rows). Consider using a LIMIT or downloading as CSV instead.")
+        load_all_confirm = st.checkbox("I understand, load entire table", value=False)
 
 with right:
     tabs = st.tabs(["Columns", "Preview", "SQL"])
@@ -170,16 +205,32 @@ with right:
     with tabs[1]:
         if do_preview:
             try:
-                df = preview_table(schema, table, limit)
-                st.dataframe(df, use_container_width=True)
-                st.download_button(
-                    "⬇️ Download CSV",
-                    data=df.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{schema}.{table}.csv",
-                    mime="text/csv",
-                )
+                if rows_mode == "Limit":
+                    df = preview_table(schema, table, int(limit))
+                    st.dataframe(df, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download CSV (limited)",
+                        data=df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{schema}.{table}.limit{int(limit)}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    if not load_all_confirm:
+                        st.info("Tick the confirmation checkbox on the left to load the full table.")
+                    else:
+                        df = preview_table_full(schema, table)
+                        st.dataframe(df, use_container_width=True)
+                        st.download_button(
+                            "⬇️ Download CSV (full table)",
+                            data=df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{schema}.{table}.csv",
+                            mime="text/csv",
+                        )
             except Exception as e:
                 st.error(f"Preview failed: {e}")
 
     with tabs[2]:
-        st.code(f'SELECT * FROM "{schema}"."{table}" LIMIT {int(limit)};', language="sql")
+        if rows_mode == "Limit":
+            st.code(f'SELECT * FROM "{schema}"."{table}" LIMIT {int(limit)};', language="sql")
+        else:
+            st.code(f'SELECT * FROM "{schema}"."{table}";', language="sql")
